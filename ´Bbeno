@@ -1,0 +1,280 @@
+"""
+Requisitos:
+    pip install selenium pandas matplotlib seaborn openai python-telegram-bot==13.15 webdriver-manager python-dotenv
+
+Antes de rodar:
+    - Crie um arquivo .env (ou defina no ambiente):
+        OPENAI_API_KEY=coloque_sua_chave
+        TELEGRAM_TOKEN=coloque_seu_token
+        TELEGRAM_CHAT_ID=coloque_seu_chat_id
+    - Ajuste os seletores CSS em SELECTORES_RESULTADO de acordo com cada site.
+
+Avisos:
+    - Sites podem mudar layout/termos; verifique a permissão de scraping.
+    - Use em ambiente de testes; resultados “.resultado” são placeholders.
+"""
+
+import os
+import time
+import random
+import logging
+from datetime import datetime
+
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from dotenv import load_dotenv
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+
+from telegram import Bot
+
+# -----------------------------
+# LOGGING
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger("slots-bot")
+
+# -----------------------------
+# CONFIGURAÇÃO
+# -----------------------------
+load_dotenv()  # lê .env se existir
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "SUA_API_KEY_OPENAI")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "SEU_TOKEN_TELEGRAM")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "SEU_CHAT_ID")
+
+# Intervalo entre coletas (segundos)
+INTERVALO = int(os.getenv("INTERVALO_SEGUNDOS", "60"))
+
+# Caminhos de saída
+ARQUIVO_CSV = os.getenv("ARQUIVO_CSV", "dados_slots.csv")
+ARQUIVO_HEATMAP = os.getenv("ARQUIVO_HEATMAP", "heatmap_slots.png")
+
+# Slots e URLs (exemplos)
+SLOTS = {
+    "Tigrinho": "https://www.betano.com/slots/tigrinho",
+    "Coelho":   "https://www.sportingbet.com/slots/coelho",
+    "Touro":    "https://www.superbet.com/slots/touro"
+}
+
+# Seletor CSS por domínio (ajuste conforme o HTML real de cada site)
+# A chave pode ser parte do domínio para checagem simples
+SELECTORES_RESULTADO = {
+    "betano.com": ".resultado",        # <- troque para o seletor correto
+    "sportingbet.com": ".resultado",   # <- troque para o seletor correto
+    "superbet.com": ".resultado"       # <- troque para o seletor correto
+}
+
+# Modelo da OpenAI (chat)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# -----------------------------
+# OPENAI (chat completions)
+# -----------------------------
+try:
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+except Exception as e:
+    openai_client = None
+    logger.warning("OpenAI não configurado corretamente: %s", e)
+
+def interagir_chatgpt(mensagem: str) -> str:
+    """
+    Gera um insight curto usando o modelo de chat da OpenAI.
+    """
+    if not openai_client or not OPENAI_API_KEY or OPENAI_API_KEY.startswith("SUA_"):
+        return "OpenAI não configurado. Defina OPENAI_API_KEY."
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Você é um analista de dados conciso e objetivo."},
+                {"role": "user", "content": mensagem}
+            ],
+            temperature=0.3,
+            max_tokens=220
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.error("Falha ao consultar OpenAI: %s", e)
+        return "Não foi possível gerar insights no momento."
+
+# -----------------------------
+# TELEGRAM
+# -----------------------------
+bot = None
+if TELEGRAM_TOKEN and not TELEGRAM_TOKEN.startswith("SEU_"):
+    try:
+        bot = Bot(token=TELEGRAM_TOKEN)
+    except Exception as e:
+        logger.error("Falha ao inicializar Bot do Telegram: %s", e)
+        bot = None
+else:
+    logger.info("Telegram não configurado (defina TELEGRAM_TOKEN/TELEGRAM_CHAT_ID).")
+
+def enviar_alerta_telegram(texto: str) -> None:
+    if not bot or not CHAT_ID or CHAT_ID.startswith("SEU_"):
+        logger.info("Alerta NÃO enviado (Telegram não configurado). Texto: %s", texto[:120])
+        return
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=texto[:4000])
+    except Exception as e:
+        logger.error("Erro ao enviar mensagem no Telegram: %s", e)
+
+# -----------------------------
+# SELENIUM (HEADLESS)
+# -----------------------------
+def criar_driver() -> webdriver.Chrome:
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")  # headless moderno
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--window-size=1280,800")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=chrome_options)
+
+driver = None
+
+# -----------------------------
+# COLETA
+# -----------------------------
+def seletor_por_url(url: str) -> str:
+    for dominio, seletor in SELECTORES_RESULTADO.items():
+        if dominio in url:
+            return seletor
+    return ".resultado"  # fallback
+
+def carregar_csv_existente() -> pd.DataFrame:
+    try:
+        df = pd.read_csv(ARQUIVO_CSV)
+        # sanity check colunas
+        colunas = {"Jogo", "Hora", "Resultado"}
+        if not colunas.issubset(df.columns):
+            raise ValueError("CSV existente com colunas incorretas.")
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["Jogo", "Hora", "Resultado"])
+
+def coletar_dados() -> pd.DataFrame:
+    global driver
+    if driver is None:
+        driver = criar_driver()
+
+    df = carregar_csv_existente()
+
+    for nome, link in SLOTS.items():
+        try:
+            driver.get(link)
+            # Espera aleatória para parecer humano e a página carregar
+            time.sleep(3 + random.uniform(1.0, 2.5))
+
+            seletor = seletor_por_url(link)
+            try:
+                resultado_elem = driver.find_element(By.CSS_SELECTOR, seletor)
+                resultado = resultado_elem.text.strip()
+                if not resultado:
+                    resultado = "Vazio"
+            except Exception:
+                resultado = "Indisponível"
+
+            hora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            df = pd.concat(
+                [df, pd.DataFrame([[nome, hora, resultado]], columns=df.columns)],
+                ignore_index=True
+            )
+            logger.info("Coletado: %s | %s | %s", nome, hora, resultado)
+
+        except Exception as e:
+            logger.error("Falha ao coletar de %s (%s): %s", nome, link, e)
+
+        # Jitter extra entre slots
+        time.sleep(1 + random.uniform(0.5, 1.5))
+
+    df.to_csv(ARQUIVO_CSV, index=False)
+    return df
+
+# -----------------------------
+# ANÁLISE + HEATMAP
+# -----------------------------
+def analisar_dados(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    # Converte Hora e cria coluna de hora do dia
+    df = df.copy()
+    df["Hora_only"] = pd.to_datetime(df["Hora"], errors="coerce").dt.hour
+
+    # Contagem de registros por hora e por jogo
+    analise = df.groupby(["Hora_only", "Jogo"]).size().unstack(1).fillna(0)
+    return analise
+
+def gerar_heatmap(analise: pd.DataFrame, caminho_png: str = ARQUIVO_HEATMAP) -> None:
+    if analise.empty:
+        logger.info("Sem dados suficientes para heatmap.")
+        return
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(analise, annot=True, fmt=".0f", cmap="YlGnBu")
+    plt.title("Heatmap de Rodadas por Hora e Slot")
+    plt.xlabel("Slot")
+    plt.ylabel("Hora do Dia")
+    plt.tight_layout()
+    plt.savefig(caminho_png)
+    plt.close()
+    logger.info("Heatmap salvo em %s", caminho_png)
+
+# -----------------------------
+# LOOP PRINCIPAL
+# -----------------------------
+def main():
+    logger.info("Iniciando coleta/monitoramento. Intervalo: %ss", INTERVALO)
+    try:
+        while True:
+            df = coletar_dados()
+            analise = analisar_dados(df)
+
+            if not analise.empty:
+                logger.info("Análise atual:\n%s", analise.tail(10))
+                gerar_heatmap(analise)
+
+                # Insight via OpenAI
+                preview = analise.tail(5).to_string()
+                mensagem = (
+                    "Você é um analista de dados. Abaixo um pivot de contagens por hora x jogo "
+                    "das últimas coletas. Dê 3 insights objetivos sobre horários mais ativos, "
+                    "anomalias e possíveis recomendações de monitoramento, em 80-120 palavras.\n\n"
+                    f"{preview}"
+                )
+                insight = interagir_chatgpt(mensagem)
+
+                # Telegram
+                enviar_alerta_telegram(f"Atualização Slots:\n{preview}\n\nInsight:\n{insight}")
+
+            else:
+                logger.info("Sem análise disponível (dados vazios).")
+
+            time.sleep(INTERVALO)
+
+    except KeyboardInterrupt:
+        logger.info("Execução interrompida pelo usuário (CTRL+C).")
+    except Exception as e:
+        logger.exception("Erro no loop principal: %s", e)
+    finally:
+        try:
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+        logger.info("Encerrado.")
+
+if __name__ == "__main__":
+    main()
